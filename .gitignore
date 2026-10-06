@@ -1,0 +1,21 @@
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local dependencies, packaging, and scratch files
+node_modules/
+*.zip
+*.log
+*.tmp
+*.bak
+coverage/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Superseded local preview
+tests/settings-preview.jpg
