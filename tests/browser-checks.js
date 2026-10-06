@@ -1,0 +1,48 @@
+'use strict';
+(async () => {
+  const pause = () => new Promise(resolve => setTimeout(resolve, 900));
+  const app = document.querySelector('app-root');
+  const events = () => testMessages.filter(message => message.type === 'EVENT');
+  let passed = 0, failed = 0;
+  function check(name, condition) {
+    const li = document.createElement('li');
+    li.textContent = `${condition ? 'PASS' : 'FAIL'} · ${name}`;
+    li.style.color = condition ? '#126341' : '#bd2525';
+    document.querySelector('#results').append(li);
+    condition ? passed++ : failed++;
+  }
+  const poll = name => `<app-poll><app-primary-header><h1>${name}</h1></app-primary-header><div class="question-image-container"><img alt="Question image hidden" class="hidden-by-instructor"></div><div id="status-text-container-id">Select an Answer</div><div class="answer-controls-container"><button>A</button><button>B</button></div></app-poll>`;
+  await pause();
+  check('隐藏的开课横幅不会误报', events().length === 0);
+  app.querySelector('.course-join-container').setAttribute('aria-hidden', 'false');
+  app.querySelector('.course-join-container').style.height = 'auto';
+  app.querySelector('.course-join-container').classList.add('expanded');
+  app.querySelector('#btnJoin').disabled = false;
+  await pause();
+  check('开课横幅出现，提醒一次', events().length === 1 && events()[0].kind === 'class');
+  app.querySelector('h1').textContent = '示例课程 · 状态已更新';
+  await pause();
+  check('无关页面文字变化不重复提醒', events().length === 1);
+  location.hash = '/class/demo/poll'; app.innerHTML = poll('Question 1');
+  await pause();
+  check('新题出现，提醒一次', events().length === 2 && events()[1].kind === 'question');
+  app.querySelector('#status-text-container-id').textContent = 'Answer Received';
+  app.querySelector('button').setAttribute('aria-pressed', 'true');
+  await pause();
+  check('自己作答不会被当作新题', events().length === 2);
+  app.querySelector('h1').textContent = 'Question 2';
+  await pause();
+  check('控件未重建时也能发现下一题', events().length === 3);
+  location.hash = '/class/demo/question/previous';
+  app.innerHTML = '<h1>Question 2</h1><button>Return to Questions</button><p>Your Answer A. Correct Answer B. All Results</p>';
+  await pause();
+  check('答题结束的结果页面不会提醒', events().length === 3);
+  location.hash = '/class/demo/poll'; app.innerHTML = poll('Question 2');
+  await pause();
+  check('同一道题重新开放可以提醒', events().length === 4);
+  location.hash = '/question/old'; app.innerHTML = poll('Question 99');
+  await pause();
+  check('历史记录绝不会当作课堂新题', events().length === 4);
+  document.querySelector('#summary').textContent = `${passed} passed, ${failed} failed`;
+  document.title = `${passed}/${passed + failed} PASS · iClicker checks`;
+})();
