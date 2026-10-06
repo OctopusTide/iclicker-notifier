@@ -16,39 +16,55 @@ const event = (eventKey = 'q1', scope = 'course:a', kind = 'question') => ({ typ
 function harness(shared = {}) {
   const state = shared.state || {};
   const settings = shared.settings || { ...defaults };
-  const calls = { desktop: [], audio: [], createDocument: [], tabsCreated: [], tabsUpdated: [] };
+  const calls = { desktop: [], audio: [], audioMessages: [], cleared: [], createDocument: [], tabsCreated: [], tabsUpdated: [] };
   const listeners = {};
   const hook = name => ({ addListener(fn) { listeners[name] = fn; } });
   const tabs = shared.tabs || [{ id: 1, url: 'https://student.iclicker.com/#/course/a', windowId: 1 }];
-  let offscreenExists = false;
+  const player = shared.player || { exists: false, playing: false, mode: null };
   const chrome = {
     runtime: {
       id: 'unit-test',
       getURL: value => `chrome-extension://unit-test/${value}`,
-      getContexts: async () => offscreenExists ? [{}] : [],
+      getContexts: async () => player.exists ? [{}] : [],
       sendMessage: async message => {
-        calls.audio.push(message);
-        return shared.audioError ? { ok: false, error: shared.audioError, errorCode: shared.audioErrorCode } : { ok: true };
+        calls.audioMessages.push(message);
+        if (message.type === 'PLAY') calls.audio.push(message);
+        if (shared.onAudioMessage) {
+          const response = await shared.onAudioMessage(message, player);
+          if (response !== undefined) return response;
+        }
+        if (message.type === 'PLAY') {
+          if (shared.audioError) return { ok: false, error: shared.audioError, errorCode: shared.audioErrorCode };
+          player.playing = message.volume > 0;
+          player.mode = player.playing ? message.mode : null;
+        }
+        if (message.type === 'STOP') { player.playing = false; player.mode = null; }
+        return { ok: true, playing: player.playing, mode: player.mode };
       },
       onMessage: hook('message')
     },
     i18n: { getUILanguage: () => shared.browserLanguage || 'en-US' },
     storage: {
       local: { get: async () => ({ settings: clone(settings) }) },
+      onChanged: hook('storage'),
       session: {
         get: async key => ({ [key]: state[key] ? clone(state[key]) : undefined }),
         set: async update => Object.assign(state, clone(update))
       }
     },
-    offscreen: { createDocument: async params => { calls.createDocument.push(params); offscreenExists = true; } },
+    offscreen: { createDocument: async params => {
+      calls.createDocument.push(params);
+      if (shared.beforeCreateDocument) await shared.beforeCreateDocument();
+      player.exists = true;
+    } },
     notifications: {
       getPermissionLevel: async () => shared.permission || 'granted',
       create: async (id, options) => {
         if (shared.desktopError) throw new Error(shared.desktopError);
         calls.desktop.push({ id, options }); return id;
       },
-      clear: async () => true,
-      onClicked: hook('clicked'), onClosed: hook('closed')
+      clear: async id => { calls.cleared.push(id); return true; },
+      onClicked: hook('clicked'), onClosed: hook('closed'), onButtonClicked: hook('buttonClicked')
     },
     tabs: {
       query: async () => tabs.filter(tab => tab.url.startsWith('https://student.iclicker.com/')),
@@ -76,7 +92,12 @@ function harness(shared = {}) {
       if (!accepted) reject(new Error('no receiver'));
     });
   }
-  return { send, state, settings, calls, listeners, tabs };
+  async function setSettings(update) {
+    const oldValue = clone(settings);
+    Object.assign(settings, update);
+    await listeners.storage({ settings: { oldValue, newValue: clone(settings) } }, 'local');
+  }
+  return { send, state, settings, calls, listeners, tabs, player, setSettings };
 }
 
 test('concurrent duplicate events across tabs deliver exactly once; distinct questions are not rate limited', async () => {
@@ -248,4 +269,169 @@ test('unrecognized browser audio error codes retain their diagnostic message', a
   const response = await h.send({ type: 'TEST_ALERT' });
   assert.match(response.error, /Audio device unavailable/);
   assert.doesNotMatch(response.error, /error\.9/);
+});
+
+test('short and long reminder modes reach the player and long notifications offer a localized stop button', async () => {
+  for (const language of ['en', 'zh-CN']) {
+    const h = harness({ settings: { ...defaults, language, reminderMode: 'long' } });
+    await h.send(event(), contentSender(1));
+    assert.equal(h.calls.audio[0].mode, 'long');
+    assert.equal(h.calls.desktop[0].options.buttons[0].title, language === 'en' ? 'Stop sound' : '停止提醒');
+    assert.equal((await h.send({ type: 'GET_STATUS' })).audio.mode, 'long');
+    await h.send({ type: 'TEST_ALERT', settings: { reminderMode: 'short' } });
+    assert.equal(h.calls.audio[1].mode, 'short');
+    assert.equal(h.calls.desktop[1].options.buttons, undefined);
+    assert.equal(h.settings.reminderMode, 'long');
+    await h.send({ type: 'TEST_ALERT', settings: { volume: 0 } });
+    assert.equal(h.calls.desktop[2].options.buttons, undefined);
+  }
+});
+
+test('status and stop never create an offscreen document; playing state survives a worker restart', async () => {
+  const first = harness({ settings: { ...defaults, reminderMode: 'long' } });
+  assert.deepEqual(clone((await first.send({ type: 'GET_STATUS' })).audio), { playing: false, mode: null });
+  assert.equal((await first.send({ type: 'STOP_ALERT' })).ok, true);
+  assert.equal(first.calls.createDocument.length, 0);
+  await first.send(event(), contentSender(1));
+  const restarted = harness({ state: first.state, player: first.player, settings: first.settings });
+  assert.deepEqual(clone((await restarted.send({ type: 'GET_STATUS' })).audio), { playing: true, mode: 'long' });
+  assert.deepEqual(clone(await restarted.send({ type: 'STOP_ALERT' })), { ok: true, playing: false, mode: null });
+  assert.equal((await restarted.send({ type: 'GET_STATUS' })).audio.playing, false);
+  assert.equal(restarted.calls.createDocument.length, 0);
+});
+
+test('content pages and foreign extensions cannot stop playback', async () => {
+  const h = harness({ settings: { ...defaults, reminderMode: 'long' } });
+  await h.send(event(), contentSender(1));
+  for (const sender of [contentSender(1), { id: 'foreign-extension', url: 'chrome-extension://unit-test/popup.html' }]) {
+    const result = await h.send({ type: 'STOP_ALERT' }, sender);
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, 'extension_sender');
+  }
+  assert.equal(h.player.playing, true);
+  assert.equal(h.calls.audioMessages.filter(message => message.type === 'STOP').length, 0);
+});
+
+test('the stop notification button stops audio without opening a tab; dismissal keeps the reminder sounding', async () => {
+  const h = harness({ settings: { ...defaults, reminderMode: 'long' } });
+  await h.send(event(), contentSender(1));
+  const firstId = h.calls.desktop[0].id;
+  h.listeners.closed(firstId);
+  await h.send({ type: 'GET_STATUS' });
+  assert.equal(h.player.playing, true);
+  await h.send(event('q2'), contentSender(1));
+  const secondId = h.calls.desktop[1].id;
+  h.listeners.buttonClicked(secondId, 0);
+  await h.send({ type: 'GET_STATUS' });
+  assert.equal(h.player.playing, false);
+  assert.ok(h.calls.cleared.includes(secondId));
+  assert.equal(h.calls.tabsCreated.length + h.calls.tabsUpdated.length, 0);
+  assert.equal(h.state.iclickerRuntime.notifications[secondId], undefined);
+});
+
+test('notification body clicks stop audio as well as focusing the source tab', async () => {
+  const h = harness({ settings: { ...defaults, reminderMode: 'long' } });
+  await h.send(event(), contentSender(1));
+  h.listeners.clicked(h.calls.desktop[0].id);
+  await h.send({ type: 'GET_STATUS' });
+  assert.equal(h.player.playing, false);
+  assert.equal(h.calls.tabsUpdated[0].id, 1);
+});
+
+test('disabling alerts, muting, setting zero volume, or switching reminder mode stops playback', async () => {
+  for (const update of [{ enabled: false }, { sound: false }, { volume: 0 }, { reminderMode: 'short' }]) {
+    const h = harness({ settings: { ...defaults, reminderMode: 'long' } });
+    await h.send(event(), contentSender(1));
+    await h.setSettings(update);
+    assert.equal(h.player.playing, false, JSON.stringify(update));
+  }
+  const h = harness({ settings: { ...defaults, reminderMode: 'long' } });
+  await h.send(event(), contentSender(1));
+  await h.setSettings({ language: 'zh-CN', desktop: false });
+  assert.equal(h.player.playing, true);
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(accept => { resolve = accept; });
+  return { promise, resolve };
+}
+
+test('stop interrupts startup immediately and prevents an in-flight audio connection retry', async () => {
+  const started = deferred();
+  const release = deferred();
+  const h = harness({ settings: { ...defaults, reminderMode: 'long', desktop: false },
+    onAudioMessage: async message => {
+      if (message.type !== 'PLAY') return;
+      started.resolve();
+      await release.promise;
+      throw new Error('Receiving end does not exist');
+    }
+  });
+  const pending = h.send(event(), contentSender(1));
+  await started.promise;
+  const stopped = await h.send({ type: 'STOP_ALERT' });
+  assert.equal(stopped.ok, true);
+  release.resolve();
+  assert.equal((await pending).channels.sound, false);
+  assert.equal(h.calls.audio.length, 1);
+});
+
+test('stop cancels queued events and playback awaiting offscreen creation without muting future alerts', async () => {
+  const creating = deferred();
+  const release = deferred();
+  const h = harness({ settings: { ...defaults, reminderMode: 'long', desktop: false },
+    beforeCreateDocument: async () => { creating.resolve(); await release.promise; }
+  });
+  const first = h.send(event(), contentSender(1));
+  await creating.promise;
+  const queued = h.send(event('q2'), contentSender(1));
+  assert.equal((await h.send({ type: 'STOP_ALERT' })).ok, true);
+  release.resolve();
+  await Promise.all([first, queued]);
+  assert.equal(h.calls.audio.length, 0);
+  assert.equal((await h.send(event('q3'), contentSender(1))).channels.sound, true);
+  assert.equal(h.calls.audio.length, 1);
+});
+
+test('a stopped sound-only event stays deduplicated when a delayed copy arrives from another tab', async () => {
+  const creating = deferred();
+  const release = deferred();
+  const h = harness({ settings: { ...defaults, reminderMode: 'long', desktop: false },
+    beforeCreateDocument: async () => { creating.resolve(); await release.promise; }
+  });
+  const pending = h.send(event(), contentSender(1));
+  await creating.promise;
+  await h.send({ type: 'STOP_ALERT' });
+  release.resolve();
+  assert.equal((await pending).channels.sound, false);
+  const delayed = await h.send(event(), contentSender(2));
+  assert.equal(delayed.skipped, 'duplicate');
+  assert.equal(h.calls.audio.length, 0);
+  const restarted = harness({ state: h.state, settings: h.settings, player: h.player });
+  assert.equal((await restarted.send(event(), contentSender(2))).skipped, 'duplicate');
+  assert.equal((await restarted.send(event('q2'), contentSender(2))).channels.sound, true);
+});
+
+test('an unanswered audio query does not report stopped unless the offscreen document has closed', async () => {
+  let failure = null;
+  const h = harness({ settings: { ...defaults, reminderMode: 'long' },
+    onAudioMessage: async (message, player) => {
+      if (message.type !== 'GET_AUDIO_STATUS' || !failure) return;
+      if (failure === 'response') return { ok: false };
+      if (failure === 'closed') player.exists = false;
+      throw new Error('Message port closed');
+    }
+  });
+  await h.send(event(), contentSender(1));
+  assert.equal((await h.send({ type: 'GET_STATUS' })).audio.playing, true);
+  for (failure of ['response', 'connection']) {
+    const status = await h.send({ type: 'GET_STATUS' });
+    assert.equal(status.ok, false);
+    assert.equal(status.errorCode, 'audio_no_response');
+    assert.equal(status.audio, undefined);
+    assert.equal(h.player.playing, true);
+  }
+  failure = 'closed';
+  assert.deepEqual(clone((await h.send({ type: 'GET_STATUS' })).audio), { playing: false, mode: null });
 });

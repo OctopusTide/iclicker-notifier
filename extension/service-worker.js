@@ -9,6 +9,7 @@ const DEDUP_MS = 10_000;
 let queue = Promise.resolve();
 let creatingOffscreen = null;
 let notificationSequence = 0;
+let soundGeneration = 0;
 
 // Serialize session mutations as well as delivery: two open course tabs must not
 // race past deduplication, including after a service-worker restart.
@@ -121,21 +122,64 @@ async function ensureOffscreen() {
   finally { creatingOffscreen = null; }
 }
 
-async function playSound(settings) {
+async function audioContexts() {
+  return chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)]
+  });
+}
+
+async function audioStatus() {
+  const idle = { playing: false, mode: null };
+  if (!(await audioContexts()).length) return idle;
+  try {
+    const response = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'GET_AUDIO_STATUS' });
+    if (!response?.ok || typeof response.playing !== 'boolean') throw localizedError('audio_no_response');
+    if (!response.playing) return idle;
+    return { playing: true, mode: response.mode === 'long' ? 'long' : 'short' };
+  } catch {
+    // Chrome can close a silent offscreen document between these two calls.
+    if (!(await audioContexts()).length) return idle;
+    // An unanswered query does not prove playback stopped. Preserve the popup's
+    // previous state and stop control by reporting an unavailable status.
+    throw localizedError('audio_no_response');
+  }
+}
+
+async function stopSound() {
+  // Invalidate requests already waiting for delivery before the first await.
+  // STOP runs outside the session queue so audio startup cannot delay it.
+  soundGeneration += 1;
+  if (!(await audioContexts()).length) return { ok: true, playing: false, mode: null };
+  try {
+    const response = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'STOP' });
+    if (!response?.ok) throw localizedError('audio_no_response');
+  } catch (error) {
+    if (!(await audioContexts()).length) return { ok: true, playing: false, mode: null };
+    throw error;
+  }
+  return { ok: true, playing: false, mode: null };
+}
+
+async function playSound(settings, generation) {
   // AUDIO_PLAYBACK documents expire after silence. A single retry handles a
   // document closing between getContexts() and sendMessage().
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (generation !== soundGeneration) return false;
     await ensureOffscreen();
+    if (generation !== soundGeneration) return false;
     let response;
     try {
       response = await chrome.runtime.sendMessage({
-        target: 'offscreen', type: 'PLAY', tone: settings.tone, volume: settings.volume,
+        target: 'offscreen', type: 'PLAY', tone: settings.tone, volume: settings.volume, mode: settings.reminderMode,
         language: ICI18n.resolveLanguage(settings.language)
       });
     } catch (error) {
+      if (generation !== soundGeneration) return false;
       if (attempt === 0 && /receiving end|connection|port closed/i.test(errorText(error))) continue;
       throw error;
     }
+    if (generation !== soundGeneration) return false;
     if (!response?.ok) {
       if (response?.errorCode && ICI18n.t(settings.language, `error.${response.errorCode}`) !== `error.${response.errorCode}`) {
         throw localizedError(response.errorCode, settings.language);
@@ -143,12 +187,12 @@ async function playSound(settings) {
       if (response?.error) throw new Error(response.error);
       throw localizedError('audio_no_response', settings.language);
     }
-    return;
+    return generation === soundGeneration && !response.cancelled;
   }
   throw localizedError('audio_connection', settings.language);
 }
 
-async function sendAlert(kind, tabId, settings, state) {
+async function sendAlert(kind, tabId, settings, state, generation) {
   const language = ICI18n.resolveLanguage(settings.language);
   const title = ICI18n.t(language, `alert.${kind}.title`);
   const message = ICI18n.t(language, `alert.${kind}.body`);
@@ -164,7 +208,10 @@ async function sendAlert(kind, tabId, settings, state) {
         const id = `iclicker:${Date.now()}:${notificationSequence++}`;
         await chrome.notifications.create(id, {
           type: 'basic', iconUrl: 'icons/icon128.png', title, message,
-          priority: 1, silent: true
+          priority: 1, silent: true,
+          ...(settings.reminderMode === 'long' && settings.sound && settings.volume > 0 ? {
+            buttons: [{ title: ICI18n.t(language, 'alert.stopSound') }]
+          } : {})
         });
         state.notifications[id] = { tabId, at: Date.now() };
         channels.desktop = true;
@@ -173,7 +220,7 @@ async function sendAlert(kind, tabId, settings, state) {
   }
   if (settings.sound) {
     operations.push((async () => {
-      try { await playSound(settings); channels.sound = true; }
+      try { channels.sound = await playSound(settings, generation); }
       catch (error) { errors.push({ channel: 'sound', code: error?.code || null, message: errorText(error, language) }); }
     })());
   }
@@ -189,7 +236,7 @@ async function sendAlert(kind, tabId, settings, state) {
   return { ok: errors.length === 0, channels, ...(errors.length ? { error: state.lastError } : {}) };
 }
 
-async function receiveEvent(message, sender) {
+async function receiveEvent(message, sender, generation) {
   if (message.kind !== 'class' && message.kind !== 'question') throw localizedError('unsupported_event');
   const eventKey = cleanString(message.eventKey, 512);
   const scope = cleanString(message.scope, 256);
@@ -206,10 +253,11 @@ async function receiveEvent(message, sender) {
   if (Object.hasOwn(state.seen, key)) return { ok: true, skipped: 'duplicate' };
   state.seen[key] = now;
   // Claim the event before delivering any channel so a worker restart does not
-  // replay a sound already heard. Total delivery failure releases this claim.
+  // replay a sound already heard. A real delivery failure releases this claim;
+  // an explicit stop keeps it so a delayed duplicate cannot restart the sound.
   await writeState(state);
-  const result = await sendAlert(message.kind, sender.tab.id, settings, state);
-  if (!result.channels.desktop && !result.channels.sound) delete state.seen[key];
+  const result = await sendAlert(message.kind, sender.tab.id, settings, state, generation);
+  if (!result.channels.desktop && !result.channels.sound && generation === soundGeneration) delete state.seen[key];
   await writeState(state);
   return result;
 }
@@ -227,11 +275,12 @@ async function receiveStatus(message, sender) {
 }
 
 async function getStatus() {
-  const [state, tabs, settings] = await Promise.all([
-    readState(), chrome.tabs.query({ url: `${STUDENT_ORIGIN}/*` }), settingsFor()
+  const [state, tabs, settings, audio] = await Promise.all([
+    readState(), chrome.tabs.query({ url: `${STUDENT_ORIGIN}/*` }), settingsFor(), audioStatus()
   ]);
   return {
     ok: true,
+    audio,
     tabs: tabs.map(tab => tab.discarded ? {
       tabId: tab.id, state: 'discarded', label: '标签页已休眠，请打开课程页面', updatedAt: 0
     } : state.tabs[tab.id] || {
@@ -258,10 +307,10 @@ async function openIclicker(tabId) {
   return { ok: true, tabId: tab.id };
 }
 
-async function handleMessage(message, sender) {
+async function handleMessage(message, sender, generation) {
   if (message.type === 'STATUS' || message.type === 'EVENT') {
     if (!isContentSender(sender)) throw localizedError('content_sender');
-    return message.type === 'STATUS' ? receiveStatus(message, sender) : receiveEvent(message, sender);
+    return message.type === 'STATUS' ? receiveStatus(message, sender) : receiveEvent(message, sender, generation);
   }
   if (!isExtensionSender(sender)) throw localizedError('extension_sender');
   if (message.type === 'GET_STATUS') return getStatus();
@@ -273,7 +322,7 @@ async function handleMessage(message, sender) {
     const settings = await settingsFor(message.settings);
     if (!settings.desktop && !settings.sound) throw localizedError('no_channels', settings.language);
     const state = await readState();
-    const result = await sendAlert('test', null, settings, state);
+    const result = await sendAlert('test', null, settings, state, generation);
     await writeState(state);
     return result;
   }
@@ -283,11 +332,27 @@ async function handleMessage(message, sender) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Do not respond to offscreen messages: its own listener owns that response.
   if (!message || message.target === 'offscreen') return false;
+  if (message.type === 'STOP_ALERT' && isExtensionSender(sender)) {
+    stopSound().then(sendResponse, error => {
+      serialized(() => recordError(error)).then(sendResponse);
+    });
+    return true;
+  }
+  const generation = soundGeneration;
   serialized(async () => {
-    try { return await handleMessage(message, sender); }
+    try { return await handleMessage(message, sender, generation); }
     catch (error) { return recordError(error); }
   }).then(sendResponse, error => sendResponse({ ok: false, error: errorText(error) }));
   return true;
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || !changes.settings) return;
+  const before = ICSettings.normalize(changes.settings.oldValue);
+  const after = ICSettings.normalize(changes.settings.newValue);
+  if (!after.enabled || !after.sound || after.volume === 0 || before.reminderMode !== after.reminderMode) {
+    return stopSound().catch(error => serialized(() => recordError(error)));
+  }
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
@@ -309,11 +374,29 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.notifications.onClicked.addListener(id => {
   if (!id.startsWith('iclicker:')) return;
+  const stopping = stopSound().catch(error => ({ error }));
   serialized(async () => {
     try {
+      const stopped = await stopping;
+      if (stopped.error) throw stopped.error;
       const state = await readState();
       await openIclicker(state.notifications[id]?.tabId);
       await chrome.notifications.clear(id);
+      delete state.notifications[id];
+      await writeState(state);
+    } catch (error) { await recordError(error); }
+  }).catch(console.error);
+});
+
+chrome.notifications.onButtonClicked.addListener((id, buttonIndex) => {
+  if (!id.startsWith('iclicker:') || buttonIndex !== 0) return;
+  const stopping = stopSound().catch(error => ({ error }));
+  serialized(async () => {
+    try {
+      const stopped = await stopping;
+      if (stopped.error) throw stopped.error;
+      await chrome.notifications.clear(id);
+      const state = await readState();
       delete state.notifications[id];
       await writeState(state);
     } catch (error) { await recordError(error); }
