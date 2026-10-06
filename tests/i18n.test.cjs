@@ -28,6 +28,15 @@ test('legacy settings acquire auto language, while invalid languages do not pers
   }
 });
 
+test('legacy settings default to short reminders and only supported reminder modes persist', () => {
+  assert.equal(defaults.reminderMode, 'short');
+  assert.equal(normalize({ sound: false }).reminderMode, 'short');
+  for (const reminderMode of ['short', 'long']) {
+    assert.equal(normalize({ reminderMode }).reminderMode, reminderMode);
+  }
+  assert.equal(normalize({ reminderMode: 'forever' }).reminderMode, 'short');
+});
+
 test('translated alert text and known errors are available in both languages', () => {
   for (const kind of ['class', 'question', 'test']) {
     for (const part of ['title', 'body']) {
@@ -44,7 +53,7 @@ test('translated alert text and known errors are available in both languages', (
 test('manifest locale catalogs resolve all placeholders and declare a valid fallback', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../extension/manifest.json'), 'utf8'));
   assert.equal(manifest.default_locale, 'en');
-  assert.equal(manifest.version, '1.1.0');
+  assert.equal(manifest.version, '1.2.0');
   const placeholders = JSON.stringify(manifest).matchAll(/__MSG_(\w+)__/g);
   const keys = [...placeholders].map(match => match[1]);
   for (const locale of ['en', 'zh_CN']) {

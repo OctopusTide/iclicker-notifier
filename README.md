@@ -11,6 +11,7 @@ A small Chrome extension that alerts you when an iClicker class starts or a new 
 - Separate alerts for class starts and new questions.
 - Desktop notifications and sound, each with its own switch.
 - Three built-in tones, adjustable volume, and a test button.
+- Short reminders play once; long reminders repeat until you stop them.
 - Automatic language selection, or choose English / 简体中文.
 - Local processing, no account setup, no analytics, and no external dependencies.
 
@@ -30,7 +31,11 @@ Keep the extracted folder: Chrome loads the extension from that location. After 
 
 1. Sign in at [iClicker Student](https://student.iclicker.com/) and open the course you want to monitor. **Leave that course's overview page open while waiting for class.** You can keep different courses in separate tabs.
 2. When class starts, manually click **Join Class**. Leave the classroom page open to receive question alerts.
-3. Open the extension to select events, notification channels, tone, volume, and language. Settings save automatically; the main switch pauses automatic alerts.
+3. Open the extension to select events, notification channels, reminder mode, tone, volume, and language. Settings save automatically; the main switch pauses automatic alerts.
+
+**Short** is the default and plays the selected tone once. **Long** repeats the tone until you click **Stop sound** in the extension or the desktop notification. Closing the extension panel does not stop a long reminder; reopen it to stop the sound. Clicking the notification itself also stops the sound and opens iClicker. Dismissing the notification alone does not stop it.
+
+The mode only changes sound playback; desktop notifications appear once per event. Turning alerts or sound off, setting volume to zero, or switching reminder modes stops the current sound. The test button follows the selected mode, including repeating in Long mode. Updating the extension keeps existing preferences and starts with Short mode unless you select Long.
 
 Click a desktop notification to return to iClicker. Sound uses your computer's current audio output, so select speakers in your operating system if you are using headphones.
 
@@ -63,6 +68,8 @@ node tests/dev-server.cjs
 ```
 
 Open `http://127.0.0.1:8765/tests/browser.html` for checks or `http://127.0.0.1:8765/extension/popup.html` for a simulated panel. The preview uses mocked Chrome APIs; it does not test actual extension permissions or notification delivery.
+
+Open `http://127.0.0.1:8765/tests/audio-browser.html` and click **Run audio checks** to verify short playback, long repetition, and stopping with the browser's real Web Audio engine. This plays a few quiet tones; extension messaging is simulated.
 
 Bug reports and contributions are welcome. Use synthetic examples and remove student details, course identifiers, and credentials from reports or screenshots.
 

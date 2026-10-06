@@ -26,6 +26,11 @@
         <div><p class="status-title" id="status-title">Connecting…</p><p class="status-detail" id="status-detail">Keep your course page open.</p></div>
       </section>
 
+      <section class="active-alert" id="active-alert" hidden>
+        <p id="audio-state" role="status" aria-live="polite"></p>
+        <button id="stop-alert" class="stop-alert" type="button" data-i18n="stop">Stop sound</button>
+      </section>
+
       <form id="settings-form">
         <fieldset disabled id="controls">
           <legend data-i18n="when">When to alert</legend>
@@ -37,6 +42,8 @@
           <label class="setting-row" for="desktop"><span data-i18n="desktop">Desktop notification</span><span class="switch"><input id="desktop" type="checkbox"><span class="switch-track" aria-hidden="true"></span></span></label>
           <label class="setting-row" for="sound"><span data-i18n="sound">Sound</span><span class="switch"><input id="sound" type="checkbox"><span class="switch-track" aria-hidden="true"></span></span></label>
           <div class="sound-options" id="sound-options">
+            <div class="tone-row"><label for="reminder-mode" data-i18n="reminderMode">Reminder</label><select id="reminder-mode" aria-describedby="reminder-hint"><option value="short" data-i18n="shortReminder">Short</option><option value="long" data-i18n="longReminder">Long</option></select></div>
+            <p class="small-note reminder-hint" id="reminder-hint" data-i18n="reminderHint">Short rings once. Long repeats until stopped.</p>
             <div class="tone-row"><label for="tone" data-i18n="tone">Tone</label><select id="tone"><option value="chime" data-i18n="chime">Soft chime</option><option value="bell" data-i18n="bell">Clear bell</option><option value="pulse" data-i18n="pulse">Short pulse</option></select></div>
             <div class="volume-row"><label for="volume" data-i18n="volume">Volume</label><input id="volume" type="range" min="0" max="100" step="5" value="65" aria-describedby="volume-hint"><output for="volume" id="volume-label">65%</output></div>
             <p class="small-note" id="volume-hint" data-i18n="audioHint">Uses your current audio output.</p>

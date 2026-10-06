@@ -7,6 +7,12 @@
       enabled: "Enable alerts", monitorStatus: "Monitor status", when: "When to alert",
       classStarted: "Class starts", questionOpened: "New question", how: "How to alert",
       desktop: "Desktop notification", sound: "Sound", tone: "Tone", volume: "Volume",
+      reminderMode: "Reminder", shortReminder: "Short", longReminder: "Long",
+      reminderHint: "Short rings once. Long repeats until stopped.",
+      stop: "Stop sound", preparingSound: "Starting sound…", ringing: "Sound is playing",
+      audioUnknown: "Sound status unavailable",
+      ringingLong: "Long reminder is ringing", stopping: "Stopping…", stopped: "Sound stopped",
+      stopSendError: "Could not stop the sound.", stopError: "Could not stop: {error}. Please retry.",
       chime: "Soft chime", bell: "Clear bell", pulse: "Short pulse",
       audioHint: "Uses your current audio output.", test: "Test alert", open: "Open iClicker ↗",
       footer: "Keep your course tab open and computer awake.",
@@ -31,6 +37,7 @@
       saving: "Saving…", saved: "Settings saved", testing: "Sending test…",
       testNeedsChannel: "Turn on desktop notifications or sound to test.",
       testSent: "Test sent. No sound? Check your audio output and volume.",
+      testLongSent: "Long reminder started. Click Stop sound to finish.",
       unknownError: "Unknown error", saveError: "Could not save: {error}. Change a setting to retry.",
       statusReadError: "Could not read the monitor status.", lastError: "Last alert issue: {error}",
       testSendError: "Could not send the test alert.", testError: "Test failed: {error}",
@@ -42,6 +49,12 @@
       enabled: "启用提醒", monitorStatus: "监测状态", when: "提醒时机",
       classStarted: "课程开始", questionOpened: "出现新题", how: "提醒方式",
       desktop: "桌面通知", sound: "声音提醒", tone: "提示音", volume: "音量",
+      reminderMode: "提醒长度", shortReminder: "短提醒", longReminder: "长提醒",
+      reminderHint: "短提醒响一次；长提醒持续响，直到手动停止。",
+      stop: "停止提醒", preparingSound: "正在启动声音…", ringing: "正在播放提醒",
+      audioUnknown: "声音状态暂时未知",
+      ringingLong: "长提醒正在响铃", stopping: "正在停止…", stopped: "提醒声音已停止",
+      stopSendError: "无法停止声音。", stopError: "停止失败：{error}。请重试。",
       chime: "轻柔和弦", bell: "清脆铃声", pulse: "短促提示",
       audioHint: "使用电脑当前的音频输出设备。", test: "测试提醒", open: "打开 iClicker ↗",
       footer: "保持课程页打开，电脑保持唤醒。",
@@ -62,6 +75,7 @@
       alertTest: "测试提醒", alertUnknown: "已发出提醒",
       saving: "正在保存…", saved: "设置已保存", testing: "正在测试…",
       testNeedsChannel: "请先打开桌面通知或声音提醒。", testSent: "测试已发送。没有声音时，请检查音量与输出设备。",
+      testLongSent: "长提醒已开始，点击“停止提醒”即可结束。",
       unknownError: "未知错误", saveError: "设置未能保存：{error}。请重新调整设置以重试。",
       statusReadError: "无法读取监测状态。", lastError: "上次提醒错误：{error}",
       testSendError: "测试提醒未能发送。", testError: "测试失败：{error}",
@@ -72,7 +86,8 @@
   const $ = id => document.getElementById(id);
   const fields = {
     enabled: $("enabled"), classStarted: $("class-started"), questionOpened: $("question-opened"),
-    desktop: $("desktop"), sound: $("sound"), tone: $("tone"), volume: $("volume"), language: $("language")
+    desktop: $("desktop"), sound: $("sound"), reminderMode: $("reminder-mode"),
+    tone: $("tone"), volume: $("volume"), language: $("language")
   };
   let currentSettings;
   let saveQueue = Promise.resolve();
@@ -80,6 +95,12 @@
   let statusResponse;
   let refreshingStatus = false;
   let statusUnavailable = false;
+  let audioStatus = { playing: false, mode: null };
+  let audioActionVersion = 0;
+  let testPending = false;
+  let testSoundPending = false;
+  let stopPending = false;
+  let stopRetry = false;
   let feedback = null;
   const errors = { action: null, status: null };
 
@@ -151,12 +172,24 @@
     renderLastError();
     renderErrors();
     renderStatus();
+    renderAudioStatus();
+  }
+
+  function renderAudioStatus() {
+    const unknown = stopRetry || (statusUnavailable && currentSettings?.sound);
+    $("active-alert").hidden = !(audioStatus.playing || testSoundPending || stopPending || unknown);
+    $("audio-state").textContent = translate(stopPending ? "stopping" : testSoundPending ? "preparingSound"
+      : unknown ? "audioUnknown" : audioStatus.mode === "long" ? "ringingLong" : "ringing");
+    $("stop-alert").disabled = stopPending;
+    $("stop-alert").textContent = translate(stopPending ? "stopping" : "stop");
+    $("test-alert").disabled = !currentSettings || testPending || stopPending;
   }
 
   function syncAudioControls() {
     const soundOn = fields.sound.checked;
     fields.tone.disabled = !soundOn;
     fields.volume.disabled = !soundOn;
+    fields.reminderMode.disabled = !soundOn;
     $("sound-options").classList.toggle("muted", !soundOn);
     $("volume-label").textContent = `${fields.volume.value}%`;
     fields.volume.setAttribute("aria-valuetext", `${fields.volume.value}%`);
@@ -167,6 +200,7 @@
       fields[key].checked = settings[key];
     }
     fields.tone.value = settings.tone;
+    fields.reminderMode.value = settings.reminderMode;
     fields.volume.value = String(Math.round(settings.volume * 100));
     fields.language.value = settings.language;
     syncAudioControls();
@@ -178,7 +212,7 @@
       enabled: fields.enabled.checked, classStarted: fields.classStarted.checked,
       questionOpened: fields.questionOpened.checked, desktop: fields.desktop.checked,
       sound: fields.sound.checked, volume: Number(fields.volume.value) / 100,
-      tone: fields.tone.value, language: fields.language.value
+      tone: fields.tone.value, reminderMode: fields.reminderMode.value, language: fields.language.value
     });
   }
 
@@ -269,16 +303,24 @@
   async function refreshStatus() {
     if (refreshingStatus) return;
     refreshingStatus = true;
+    const audioVersion = audioActionVersion;
     try {
       const response = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
       if (!response?.ok) throw new Error(response?.error || translate("statusReadError"));
       statusResponse = response;
+      // A status response sent before Stop must not make stopped audio look active again.
+      if (audioVersion === audioActionVersion && !stopPending) {
+        audioStatus = response.audio || { playing: false, mode: null };
+        stopRetry = false;
+      }
       statusUnavailable = false;
       renderStatus();
       renderLastError();
+      renderAudioStatus();
     } catch (error) {
       statusUnavailable = true;
       renderStatus();
+      renderAudioStatus();
       showError(describeError(error), "status");
     } finally {
       refreshingStatus = false;
@@ -290,25 +332,56 @@
   fields.volume.addEventListener("input", syncAudioControls);
 
   $("test-alert").addEventListener("click", async () => {
-    const button = $("test-alert");
-    button.disabled = true;
+    const version = ++audioActionVersion;
+    const settings = readSettings();
+    testPending = true;
+    testSoundPending = settings.sound && settings.volume > 0;
+    renderAudioStatus();
     showError();
     setFeedback("testing");
     try {
-      const settings = readSettings();
       if (!settings.desktop && !settings.sound) {
         setFeedback("testNeedsChannel");
         return;
       }
       const response = await chrome.runtime.sendMessage({ type: "TEST_ALERT", settings });
+      if (version !== audioActionVersion) return;
       if (!response?.ok) throw new Error(response?.error || translate("testSendError"));
-      setFeedback("testSent");
-      await refreshStatus();
+      setFeedback(settings.reminderMode === "long" && settings.sound && settings.volume > 0 ? "testLongSent" : "testSent");
     } catch (error) {
-      setFeedback();
-      showError({ key: "testError", params: { error: describeError(error) } });
+      if (version === audioActionVersion) {
+        setFeedback();
+        showError({ key: "testError", params: { error: describeError(error) } });
+      }
     } finally {
-      button.disabled = false;
+      testPending = false;
+      if (version === audioActionVersion) testSoundPending = false;
+      await refreshStatus();
+      renderAudioStatus();
+    }
+  });
+
+  $("stop-alert").addEventListener("click", async () => {
+    ++audioActionVersion;
+    stopPending = true;
+    testSoundPending = false;
+    renderAudioStatus();
+    showError();
+    setFeedback("stopping");
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "STOP_ALERT" });
+      if (!response?.ok) throw new Error(response?.error || translate("stopSendError"));
+      audioStatus = { playing: false, mode: null };
+      stopRetry = false;
+      setFeedback("stopped");
+    } catch (error) {
+      stopRetry = true;
+      setFeedback();
+      showError({ key: "stopError", params: { error: describeError(error) } });
+    } finally {
+      stopPending = false;
+      renderAudioStatus();
+      await refreshStatus();
     }
   });
 
@@ -343,6 +416,6 @@
   void initialize();
   const statusInterval = setInterval(() => {
     if (!document.hidden) void refreshStatus();
-  }, 5000);
+  }, 1000);
   addEventListener("pagehide", () => clearInterval(statusInterval), { once: true });
 })();
